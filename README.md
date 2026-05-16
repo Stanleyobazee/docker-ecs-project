@@ -14,9 +14,11 @@ A hands-on DevOps project that containerizes a Node.js REST API and deploys it t
 - [Technology Stack](#technology-stack)
 - [Setup & Deployment Guide](#setup--deployment-guide)
 - [Update Workflow](#update-workflow)
+- [Image Version History](#image-version-history)
 - [API Endpoints](#api-endpoints)
 - [Learning Curves & Challenges](#learning-curves--challenges)
 - [What We Achieved](#what-we-achieved)
+- [Cleanup](#cleanup)
 
 ---
 
@@ -127,6 +129,7 @@ docker-ecs-project/
 ├── package.json            # Node.js dependencies
 ├── package-lock.json       # Locked dependency versions
 ├── task-definition.json    # ECS Fargate task definition
+├── .gitignore              # Excludes node_modules and .env
 ├── README.md               # This file
 └── src/
     └── index.js            # Express API application
@@ -137,11 +140,29 @@ docker-ecs-project/
 ## What We Built
 
 ### 1. Node.js Express API
+
 A lightweight REST API with two endpoints:
 - `GET /` — HTML landing page
-- `GET /health` — JSON health check response with container identity metadata
+- `GET /health` — JSON health check response with full container identity metadata
+
+The health endpoint fetches the real ECS task ID at runtime from the `ECS_CONTAINER_METADATA_URI_V4` endpoint — a metadata service automatically injected by Fargate into every running container.
+
+```js
+let taskId = os.hostname();
+if (process.env.ECS_CONTAINER_METADATA_URI_V4) {
+  const http = require('http');
+  http.get(`${process.env.ECS_CONTAINER_METADATA_URI_V4}/task`, (res) => {
+    let data = '';
+    res.on('data', chunk => data += chunk);
+    res.on('end', () => {
+      try { taskId = JSON.parse(data).TaskARN.split('/').pop(); } catch (e) {}
+    });
+  }).on('error', () => {});
+}
+```
 
 ### 2. Multi-Stage Dockerfile
+
 ```dockerfile
 # Stage 1 — install production dependencies only
 FROM node:18-alpine AS builder
@@ -160,7 +181,16 @@ EXPOSE 3000
 CMD ["node", "src/index.js"]
 ```
 
-### 3. AWS Infrastructure
+### 3. ECS Task Definition
+
+The task definition (`task-definition.json`) defines:
+- 256 CPU units and 512MB memory (Fargate)
+- Environment variables: `APP_VERSION`, `TARGET_GROUP`, `ENVIRONMENT`
+- Container health check using `wget` on `/health`
+- CloudWatch log driver streaming to `/ecs/academy-api`
+
+### 4. AWS Infrastructure
+
 | Resource | Name | Purpose |
 |---|---|---|
 | ECR Repository | academy-api | Stores Docker images |
@@ -183,12 +213,13 @@ CMD ["node", "src/index.js"]
 | Runtime | Node.js 18 (Alpine) |
 | Framework | Express.js |
 | Containerization | Docker (multi-stage build) |
-| Image Registry | Amazon ECR |
+| Image Registry | Amazon ECR (immutable tags) |
 | Container Orchestration | Amazon ECS Fargate |
 | Load Balancing | AWS Application Load Balancer |
 | Logging | Amazon CloudWatch Logs |
 | IAM | AWS IAM (least privilege) |
 | CLI | AWS CLI v2 |
+| Version Control | Git + GitHub |
 
 ---
 
@@ -334,10 +365,11 @@ Zero-downtime rolling deployment process:
 docker build -t academy-api:1.x .
 
 # 3. Push to ECR
+ECR_URI=<account-id>.dkr.ecr.<region>.amazonaws.com
 docker tag academy-api:1.x $ECR_URI/academy-api:1.x
 docker push $ECR_URI/academy-api:1.x
 
-# 4. Update task-definition.json image tag, then register new revision
+# 4. Update image tag in task-definition.json, then register new revision
 aws ecs register-task-definition \
   --cli-input-json file://task-definition.json --region <region>
 
@@ -354,6 +386,30 @@ ECS rolling update behaviour:
 - Waits for new tasks to pass ALB health checks
 - Drains connections from old tasks
 - Stops old tasks — no downtime
+
+### Monitor deployment status
+```bash
+aws ecs describe-services \
+  --cluster academy-cluster \
+  --services academy-api-service \
+  --query 'services[0].deployments[*].{Status:status,TaskDef:taskDefinition,Running:runningCount,Desired:desiredCount}' \
+  --region <region> \
+  --output table
+```
+
+---
+
+## Image Version History
+
+| Tag | Task Definition | Changes |
+|---|---|---|
+| 1.0 | academy-api:1 | Initial release — basic `/` and `/health` endpoints |
+| 1.1 | academy-api:3 | Added `environment`, `targetGroup`, `taskId`, `containerId` fields to `/health` |
+| 1.2 | academy-api:4 | Fixed `taskId` parsing from ECS metadata URI |
+| 1.3 | academy-api:5 | Attempted taskId fix via URI index — superseded by 1.5 |
+| 1.5 | academy-api:8 | Final — correct taskId fetched from `ECS_CONTAINER_METADATA_URI_V4/task` endpoint |
+
+> Note: Tag `1.4` exists in ECR but points to an intermediate build. Tag `1.5` is the final production image.
 
 ---
 
@@ -380,12 +436,22 @@ Returns a JSON object identifying the container serving the request:
 
 | Field | Source | Purpose |
 |---|---|---|
+| `status` | Hardcoded | Health check status |
 | `version` | `APP_VERSION` env var | Identifies deployed app version |
 | `environment` | `ENVIRONMENT` env var | Identifies deployment environment |
 | `targetGroup` | `TARGET_GROUP` env var | Identifies which ALB target group |
 | `host` | `os.hostname()` | Container's internal DNS name |
 | `taskId` | ECS metadata endpoint | Unique ECS task identifier |
 | `containerId` | `os.hostname()` | Short container hostname |
+
+Hitting the endpoint multiple times shows different `taskId` and `host` values as the ALB routes requests across all 5 Fargate tasks:
+
+```bash
+for i in {1..10}; do
+  curl -s http://<alb-dns>/health | python3 -m json.tool
+  echo "---"
+done
+```
 
 ---
 
@@ -396,32 +462,49 @@ Returns a JSON object identifying the container serving the request:
 
 **Lesson:** Always commit `package-lock.json`. Use `npm ci` in Docker/CI, `npm install` locally.
 
-### 2. Region Consistency
-Multiple errors occurred from mixing `us-east-1` and `eu-north-1` across commands — VPC IDs, security groups, and ECR URIs are all region-scoped.
-
-**Lesson:** Set region as a shell variable at the start of every session and reference it consistently.
-
-### 3. `package.json` Location
-The file was inside `src/` instead of the project root. Docker's build context looks for files relative to the Dockerfile location.
+### 2. `package.json` in Wrong Directory
+The file was inside `src/` instead of the project root. Docker's build context looks for files relative to the Dockerfile location, causing the build to fail with `"/package.json": not found`.
 
 **Lesson:** Understand Docker's build context — files must exist at the path specified in `COPY` instructions relative to the build context root.
 
+### 3. Region Consistency
+Multiple errors occurred from mixing `us-east-1` and `eu-north-1` across commands — VPC IDs, security groups, ECR URIs, and ALB ARNs are all region-scoped. Commands silently used wrong resources or failed with cryptic errors.
+
+**Lesson:** Set region as a shell variable at the start of every session:
+```bash
+REGION=eu-north-1
+```
+Reference it consistently in every command.
+
 ### 4. ECR Immutable Tags
-Once a tag is pushed to ECR with immutability enabled, it cannot be overwritten. Attempting to push `1.4` again failed.
+Once a tag is pushed to ECR with immutability enabled, it cannot be overwritten. Attempting to push `1.4` again after a code change failed with an authorization error.
 
 **Lesson:** Always increment image tags for each build. Never reuse tags in production — immutability is a security feature that prevents accidental overwrites.
 
-### 5. ECS Task Metadata for Container Identity
-Extracting the real ECS task ID required fetching from the `ECS_CONTAINER_METADATA_URI_V4` endpoint at runtime — a Fargate-injected environment variable pointing to a local HTTP metadata service.
+### 5. Committing `node_modules` to Git
+The first `git commit` included all 622 files from `node_modules/` because `.gitignore` was not created beforehand. This was fixed by adding `.gitignore` and running `git rm -r --cached node_modules`.
 
-**Lesson:** ECS Fargate injects `ECS_CONTAINER_METADATA_URI_V4` automatically. Use it to get task ARN, cluster, container ID, and resource limits at runtime.
+**Lesson:** Always create `.gitignore` before the first commit. `node_modules` should never be committed — it is reproducible from `package-lock.json` via `npm ci`.
 
-### 6. Security Group Layering
+### 6. ECS Task Metadata for Container Identity
+Extracting the real ECS task ID required multiple iterations:
+- First attempt: parsed the metadata URI string directly — returned `"v4"` instead of the task ID
+- Second attempt: used wrong array index — still incorrect
+- Final solution: fetched the `/task` endpoint at runtime and parsed `TaskARN`
+
+**Lesson:** ECS Fargate injects `ECS_CONTAINER_METADATA_URI_V4` automatically. The correct approach is to make an HTTP GET to `${ECS_CONTAINER_METADATA_URI_V4}/task` and parse the `TaskARN` field from the JSON response.
+
+### 7. Security Group Layering
 Directly exposing ECS tasks to the internet is a security risk. The correct pattern is ALB SG → ECS SG with source group reference, ensuring only the ALB can reach the containers.
 
 **Lesson:** Never open ECS task ports to `0.0.0.0/0`. Always restrict inbound to the ALB security group using source group references.
 
-### 7. Multi-Stage Docker Builds
+### 8. Security Group Deletion Order
+Deleting the ECS security group before the ALB was fully deleted caused a `DependencyViolation` error because network interfaces were still attached.
+
+**Lesson:** Always delete resources in dependency order — services first, then load balancers, then security groups. Wait for ALB deletion to complete before removing security groups.
+
+### 9. Multi-Stage Docker Builds
 Using a builder stage to install dependencies and copying only `node_modules` to the production stage keeps the final image lean — no build tools, no dev dependencies.
 
 **Lesson:** Multi-stage builds reduce image size and attack surface. The production image only contains what's needed to run the app.
@@ -433,15 +516,51 @@ Using a builder stage to install dependencies and copying only `node_modules` to
 | Goal | Status |
 |---|---|
 | Containerized Node.js app with multi-stage Dockerfile | ✅ |
-| Pushed image to Amazon ECR | ✅ |
+| Pushed image to Amazon ECR with immutable tags | ✅ |
 | Deployed to ECS Fargate with 5 running tasks | ✅ |
 | Internet-facing ALB routing traffic across all tasks | ✅ |
-| ALB health checks on `/health` endpoint | ✅ |
+| Container-level health checks on `/health` endpoint | ✅ |
+| ALB health checks with configurable thresholds | ✅ |
 | Security groups restricting traffic (ALB → ECS only) | ✅ |
 | Container logs streaming to CloudWatch | ✅ |
-| Each container uniquely identifiable via task ID | ✅ |
-| Zero-downtime rolling deployments | ✅ |
-| Environment and version metadata per container | ✅ |
+| Each container uniquely identifiable via ECS task ID | ✅ |
+| Zero-downtime rolling deployments across 8 task definition revisions | ✅ |
+| Environment, version, and target group metadata per container | ✅ |
+| Project versioned and published to GitHub | ✅ |
+| All AWS resources cleanly deleted after project completion | ✅ |
+
+---
+
+## Cleanup
+
+To delete all AWS resources created in this project:
+
+```bash
+# 1. Scale down and delete ECS service
+aws ecs update-service --cluster academy-cluster --service academy-api-service --desired-count 0 --region <region>
+aws ecs delete-service --cluster academy-cluster --service academy-api-service --region <region>
+
+# 2. Delete ECS cluster
+aws ecs delete-cluster --cluster academy-cluster --region <region>
+
+# 3. Delete ALB and target group
+aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN --region <region>
+aws elbv2 delete-target-group --target-group-arn $TG_ARN --region <region>
+
+# 4. Delete security groups (wait for ALB to finish deleting first)
+aws ec2 delete-security-group --group-id $ECS_SG --region <region>
+aws ec2 delete-security-group --group-id $ALB_SG --region <region>
+
+# 5. Delete ECR repository and all images
+aws ecr delete-repository --repository-name academy-api --force --region <region>
+
+# 6. Delete CloudWatch log group
+aws logs delete-log-group --log-group-name /ecs/academy-api --region <region>
+
+# 7. Delete IAM role
+aws iam detach-role-policy --role-name ecsTaskExecutionRole --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam delete-role --role-name ecsTaskExecutionRole
+```
 
 ---
 
